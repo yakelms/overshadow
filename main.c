@@ -10,8 +10,17 @@
 #include <getopt.h>
 #include <string.h>
 #include <limits.h>
+#include <endian.h>
 
-/* get file pathname and generate a 16 btypes key to encrypt file. */
+
+#define NAME_PREFIX "crypt_"
+#define PREFIX_LEN strlen(NAME_PREFIX)
+
+#define PROCESS_NUM 4
+
+#define OP_ENCRYPT 0x01
+#define OP_DECRYPT 0x02
+
 
 int generate_key(unsigned char *buf, int len)
 {
@@ -38,12 +47,44 @@ int generate_key(unsigned char *buf, int len)
 
     return 0;
 }
-int decryption_file(unsigned char *key, int key_size, int fd);
-#define NAME_PREFIX "crypt_"
-#define PREFIX_LEN strlen(NAME_PREFIX)
 
-#define PROCESS_NUM 4
-int encrypt_file(const char *pathname)
+
+int get_output_path (const char *pathname, char *newpath, int size, char flag)
+{
+    //去掉路径前缀
+    int len = 0;
+    const char *filename;
+    char *slash = strrchr(pathname, '/');
+    if (slash) {
+        filename = slash + 1;
+        len = slash - pathname + 1;
+        if (len > size)
+            return -1;
+        strncpy(newpath, pathname, len);
+    } else {
+        filename = pathname;
+    }
+
+    char newname[NAME_MAX];
+    if (OP_DECRYPT == flag) {
+        if (strncmp(NAME_PREFIX, filename, PREFIX_LEN)) {
+            snprintf(newname, sizeof(newname), "de_%s", filename);
+        } else {
+            snprintf(newname, sizeof(newname), "%s", filename + PREFIX_LEN);
+        }
+    } else if (OP_ENCRYPT == flag) {
+        snprintf(newname, sizeof(newname), "%s%s", NAME_PREFIX, filename);
+    } else {
+        return -1;
+    }
+
+    len += snprintf(newpath + len, size - len, "%s", newname);
+
+    return len;
+}
+
+
+int encrypt_file(const char *pathname, const char *outputfile)
 {
     int fd;
     if (-1 == (fd = open(pathname, O_RDONLY))) {
@@ -59,7 +100,7 @@ int encrypt_file(const char *pathname)
     }
 
     long int size = filestat.st_size;
-    printf("get file %s, size %ldB\n", pathname, size);
+    printf("get file %s, size %ld bytes\n", pathname, size);
 
     if (!size) {
         close(fd);
@@ -75,9 +116,15 @@ int encrypt_file(const char *pathname)
     u_int64_t key = *(u_int64_t *)encryption_key;
 
     int e_fd;
-    char newfile[NAME_MAX];
-    snprintf(newfile, NAME_MAX, NAME_PREFIX"%s", pathname);
-    if ((e_fd = open(newfile, O_CREAT|O_TRUNC|O_RDWR, S_IRUSR|S_IWUSR)) == -1) {
+    if (!outputfile) {
+        char newfile[PATH_MAX];
+        if (0 < get_output_path(pathname, newfile, sizeof(newfile), OP_ENCRYPT))
+            outputfile = newfile;
+        else
+            return -1;
+    }
+    
+    if ((e_fd = open(outputfile, O_CREAT|O_TRUNC|O_RDWR, S_IRUSR|S_IWUSR)) == -1) {
         close(fd);
         perror("create encryption file error:");
         return -1;
@@ -88,7 +135,12 @@ int encrypt_file(const char *pathname)
 
     long int newfilesize = new_size + sizeof(u_int64_t) + sizeof(u_int64_t);
     //mmap 映射不能增加文件长度，必须先增加文件长度，在映射写入文件内容
-    ftruncate(e_fd, newfilesize);
+    if (0 != ftruncate(e_fd, newfilesize)) {
+        perror("truncate file failed:");
+        close(fd);
+        close(e_fd);
+        return -1;
+    }
 
     void *dst_context = mmap(NULL, newfilesize, PROT_WRITE, MAP_SHARED, e_fd, 0);
     if (MAP_FAILED == dst_context) {
@@ -110,6 +162,10 @@ int encrypt_file(const char *pathname)
         close(e_fd);
         return -1;
     }
+
+    //标准输出重定向到文件时，默认是行缓冲，多进程环境下，缓冲内容被复制到子进程后被冲刷到终端
+    fflush(stdout);
+    fflush(stderr);
 
     int block_num = new_size / sizeof(u_int64_t);
     int map_blocks = block_num / PROCESS_NUM;
@@ -138,11 +194,7 @@ int encrypt_file(const char *pathname)
     }
 
     //encryption file context and write to encryption file.
-    //int wr_blocks = map_blocks * (PROCESS_NUM - 1);
     int blocks = block_num - wr_blocks - 1;
-    printf("block_num=%d, map_blocks=%d, wr_blocks=%d, blocks=%d\n",
-        block_num, map_blocks, wr_blocks, blocks);
-
     u_int64_t *txt = (u_int64_t *)context + wr_blocks;
     dst += wr_blocks;
     for (i = 0; i < blocks; i++)
@@ -151,15 +203,30 @@ int encrypt_file(const char *pathname)
     }
 
     /* 明文文件最后一块不足8字节的以0填充后加密写入加密文件 */
+    int last_block_bytes = end ? end : sizeof(u_int64_t);
+    printf("last block bytes %d\n", last_block_bytes);
+#if 0
     u_int64_t tmp = 0;
     unsigned char *t = (unsigned char *)&tmp;
     unsigned char *ct = (unsigned char *)txt;
-    for (i = 0; i < end; i++)
+    for (i = 0; i < last_block_bytes; i++)
         *t++ = *ct++;
+#else
+    u_int64_t mask = ((u_int64_t)-1) << ((sizeof(u_int64_t) - last_block_bytes) * 8);
+    /*
+    #if __BYTE_ORDER == __LITTLE_ENDIAN
+    mask = __bswap_64(mask);
+    printf("little endian!\n");
+    #endif
+    */
+    u_int64_t tmp = (*txt) & htobe64(mask);
+
+    //printf("last %d byte, %#lx, %#lx, mask=%#lx\n", last_block_bytes, tmp, tmp1, mask);
+#endif
     *dst++ = tmp ^ key;
 
     /* 文件最后写入最后一块加密数据的有效字节数，也是加密之后写入 */
-    tmp = end;
+    tmp = last_block_bytes;
 
     *dst = tmp ^ key;
 
@@ -174,14 +241,17 @@ int encrypt_file(const char *pathname)
     munmap(dst_context, newfilesize);
     close(fd);
     close(e_fd);
-    printf("encryption file over\n");
+    printf("encryption file over, file size %ld bytes\n", newfilesize);
     
     return 0;
 }
 
-//int decrypt_file(unsigned char *decryption_key, int key_size, int fd)
-int decrypt_file(const char *pathname)
+int decrypt_file(const char *pathname, const char *outputfile)
 {
+    //为避免输出缓冲复制到子进程中被冲刷到终端
+    setbuf(stdout, NULL);
+    setbuf(stderr, NULL);
+
     int fd;
     if (-1 == (fd = open(pathname, O_RDONLY))) {
         perror(pathname);
@@ -196,7 +266,7 @@ int decrypt_file(const char *pathname)
     }
 
     long int size = filestat.st_size;
-    printf("get file %s, size %ldB\n", pathname, size);
+    printf("get file %s, size %ld bytes\n", pathname, size);
 
     if (!size) {
         close(fd);
@@ -217,9 +287,15 @@ int decrypt_file(const char *pathname)
     }
 
     int newfd;
-    const char *newfile = pathname + PREFIX_LEN;
+    if (!outputfile) {
+        char newfile[PATH_MAX];
+        if (0 < get_output_path(pathname, newfile, sizeof(newfile), OP_DECRYPT))
+            outputfile = newfile;
+        else
+            return -1;
+    }
 
-    if ((newfd = open(newfile, O_CREAT|O_TRUNC|O_RDWR, S_IRUSR|S_IWUSR)) == -1) {
+    if ((newfd = open(outputfile, O_CREAT|O_TRUNC|O_RDWR, S_IRUSR|S_IWUSR)) == -1) {
         munmap(context, size);
         perror("create encryption file error:");
         close(fd);
@@ -231,12 +307,17 @@ int decrypt_file(const char *pathname)
     u_int64_t key = *(u_int64_t *)context;      //get decryption key from first block
     u_int64_t *txt = (u_int64_t *)context + 1;
     u_int64_t last_block = *(txt + r - 1) ^ key;
-    printf("get last block as %ld\n", last_block);
 
     /* 原文件长度等于加密文件长度去掉秘钥块长度，末尾块长度，填充字节长度*/
     long int newfilesize = size - (sizeof(u_int64_t) * 3) + last_block;
     //mmap 映射不能增加文件长度，必须先增加文件长度，在映射写入文件内容
-    ftruncate(newfd, newfilesize);
+    if (0 != ftruncate(newfd, newfilesize)) {
+        perror("truncate file failed:");
+        close(fd);
+        close(newfd);
+        munmap(context, size);
+        return -1;
+    }
 
     void *dst_context = mmap(NULL, newfilesize, PROT_WRITE, MAP_SHARED, newfd, 0);
     if (MAP_FAILED == dst_context) {
@@ -297,18 +378,18 @@ int decrypt_file(const char *pathname)
     close(newfd);
     munmap(context, size);
     close(fd);
-    printf("decryption file size %ld.\n", newfilesize);
+    printf("decryption file over, file size %ld bytes.\n", newfilesize);
 
     return 0;
 }
 
-#define usage(app) do { printf("Usage: %s -{e|d} <pathname>\n", (app)); exit(EXIT_FAILURE);}while(0);
+#define usage(app) do { printf("Usage: %s -{e|d} <inputfile> [outputfile]\n", (app)); exit(EXIT_FAILURE);}while(0);
 #define ENCRYPT 0x01
 #define DECRYPT 0x02
 
 int main(int argc, char **argv)
 {
-    if (argc != 3) {
+    if (argc < 3) {
         usage(argv[0]);
     }
 
@@ -340,9 +421,9 @@ int main(int argc, char **argv)
 
     int rlt;
     if (mode == ENCRYPT) {
-        rlt = encrypt_file(argv[2]);
+        rlt = encrypt_file(argv[2], argc == 4 ? argv[3] : NULL);
     } else if (mode == DECRYPT) {
-        rlt = decrypt_file(argv[2]);
+        rlt = decrypt_file(argv[2], argc == 4 ? argv[3] : NULL);
     } else {
         usage(argv[0]);
     }
