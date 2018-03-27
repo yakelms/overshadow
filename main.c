@@ -22,6 +22,8 @@
 #define OP_DECRYPT 0x02
 
 
+int g_workers_num = 0;
+
 int generate_key(unsigned char *buf, int len)
 {
     if (len % sizeof(long))
@@ -168,12 +170,13 @@ int encrypt_file(const char *pathname, const char *outputfile)
     fflush(stderr);
 
     int block_num = new_size / sizeof(u_int64_t);
-    int map_blocks = block_num / PROCESS_NUM;
+    int workers_nb = g_workers_num ? g_workers_num : PROCESS_NUM;
+    int map_blocks = block_num / workers_nb;
     
-    pid_t processes_array[PROCESS_NUM - 1];
+    pid_t processes_array[workers_nb - 1];
     int i;
     int wr_blocks = 0;
-    for (i = 0; i < PROCESS_NUM - 1; i++) {
+    for (i = 0; i < workers_nb - 1; i++) {
         processes_array[i] = fork();
         if (-1 == processes_array[i])
             perror("fork");
@@ -230,7 +233,7 @@ int encrypt_file(const char *pathname, const char *outputfile)
 
     *dst = tmp ^ key;
 
-    for (i = 0; i < PROCESS_NUM - 1; i++) {
+    for (i = 0; i < workers_nb - 1; i++) {
         if (-1 != processes_array[i]) {
             int wstatus;
             waitpid(processes_array[i], &wstatus, 0);    
@@ -329,11 +332,12 @@ int decrypt_file(const char *pathname, const char *outputfile)
     }
 
     u_int64_t *dst = (u_int64_t *)dst_context;
-    pid_t processes_array[PROCESS_NUM - 1];
-    int map_blocks = (r - 1) / PROCESS_NUM;
+    int workers_nb = g_workers_num ? g_workers_num : PROCESS_NUM;
+    pid_t processes_array[workers_nb - 1];
+    int map_blocks = (r - 1) / workers_nb;
     int i;
     int wr_blocks = 0;
-    for (i = 0; i < PROCESS_NUM - 1; i++) {
+    for (i = 0; i < workers_nb - 1; i++) {
         processes_array[i] = fork();
         if (-1 == processes_array[i])
             perror("fork");
@@ -374,6 +378,12 @@ int decrypt_file(const char *pathname, const char *outputfile)
     *dst = *txt ^ key;
 #endif
 
+    for (i = 0; i < workers_nb - 1; i++) {
+        if (-1 != processes_array[i]) {
+            int wstatus;
+            waitpid(processes_array[i], &wstatus, 0);    
+        }
+    }
     munmap(dst_context, newfilesize);
     close(newfd);
     munmap(context, size);
@@ -383,9 +393,10 @@ int decrypt_file(const char *pathname, const char *outputfile)
     return 0;
 }
 
-#define usage(app) do { printf("Usage: %s -{e|d} <inputfile> [outputfile]\n", (app)); exit(EXIT_FAILURE);}while(0);
+#define usage(app) do { printf("Usage: %s -{e|d|h} [-p <processes>] -i <inputfile> [-o outputfile]\n", (app)); exit(EXIT_FAILURE);}while(0);
 #define ENCRYPT 0x01
 #define DECRYPT 0x02
+
 
 int main(int argc, char **argv)
 {
@@ -401,12 +412,15 @@ int main(int argc, char **argv)
     struct option longopts[] = {
         {"encrypt", required_argument, NULL, 'e'},
         {"decrypt", required_argument, NULL, 'd'},
+        {"processes", required_argument, NULL, 'p'},
+        {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0}
     };
 
     int option_index = 0;
     int msgflag = 0600;
-    while ((opt = getopt_long(argc, argv, "e:d:", longopts, &option_index)) != -1) {
+    char *inputfile = NULL, *outputfile = NULL;
+    while ((opt = getopt_long(argc, argv, "edp:hi:o:", longopts, &option_index)) != -1) {
         switch (opt) {
             case 'e':
                 mode |= ENCRYPT;
@@ -414,6 +428,16 @@ int main(int argc, char **argv)
             case 'd':
                 mode |= DECRYPT;
                 break;
+            case 'p':
+                g_workers_num = strtol(optarg, NULL, 10); 
+                break;
+            case 'i':
+                inputfile = optarg;
+                break;
+            case 'o':
+                outputfile = optarg;
+                break;
+            case 'h':
             default:
                 usage(argv[0]);
         }
@@ -421,9 +445,9 @@ int main(int argc, char **argv)
 
     int rlt;
     if (mode == ENCRYPT) {
-        rlt = encrypt_file(argv[2], argc == 4 ? argv[3] : NULL);
+        rlt = encrypt_file(inputfile, outputfile);
     } else if (mode == DECRYPT) {
-        rlt = decrypt_file(argv[2], argc == 4 ? argv[3] : NULL);
+        rlt = decrypt_file(inputfile, outputfile);
     } else {
         usage(argv[0]);
     }
