@@ -102,7 +102,7 @@ int encrypt_file(const char *pathname, const char *outputfile)
     }
 
     long int size = filestat.st_size;
-    printf("get file %s, size %ld bytes\n", pathname, size);
+    /* printf("get file %s, size %ld bytes\n", pathname, size); */
 
     if (!size) {
         close(fd);
@@ -171,6 +171,9 @@ int encrypt_file(const char *pathname, const char *outputfile)
 
     int block_num = new_size / sizeof(u_int64_t);
     int workers_nb = g_workers_num ? g_workers_num : PROCESS_NUM;
+    //if encryption file size is litter than 32KB , used 1 process
+    if (block_num < 4096)
+        workers_nb = 1;
     int map_blocks = block_num / workers_nb;
     
     pid_t processes_array[workers_nb - 1];
@@ -207,7 +210,7 @@ int encrypt_file(const char *pathname, const char *outputfile)
 
     /* 明文文件最后一块不足8字节的以0填充后加密写入加密文件 */
     int last_block_bytes = end ? end : sizeof(u_int64_t);
-    printf("last block bytes %d\n", last_block_bytes);
+    /* printf("last block bytes %d\n", last_block_bytes); */
 #if 0
     u_int64_t tmp = 0;
     unsigned char *t = (unsigned char *)&tmp;
@@ -244,9 +247,34 @@ int encrypt_file(const char *pathname, const char *outputfile)
     munmap(dst_context, newfilesize);
     close(fd);
     close(e_fd);
-    printf("encryption file over, file size %ld bytes\n", newfilesize);
+    /* printf("encryption file over, file size %ld bytes\n", newfilesize); */
     
     return 0;
+}
+
+int process_decrypt(u_int64_t *dst, u_int64_t *src, u_int64_t key, int blocks, int offset)
+{
+    if (!dst || !src || !blocks)
+        return 0;
+
+    pid_t pid;
+    pid = fork();
+    if (-1 == pid) {
+        perror("fork");
+        return -1;
+    }
+    else if (pid == 0) {
+        int i;
+        u_int64_t *plain = dst + offset;
+        u_int64_t *shadow = src + offset;
+        for (i = 0; i < blocks; i++) {
+            *plain++ = *shadow++ ^ key;
+        }
+
+        exit(EXIT_SUCCESS);
+    }
+
+    return pid;
 }
 
 int decrypt_file(const char *pathname, const char *outputfile)
@@ -333,10 +361,15 @@ int decrypt_file(const char *pathname, const char *outputfile)
 
     u_int64_t *dst = (u_int64_t *)dst_context;
     int workers_nb = g_workers_num ? g_workers_num : PROCESS_NUM;
+    //if encryption file size is litter than 32KB , used 1 process
+    if (r < 4096)
+        workers_nb = 1;
+
     pid_t processes_array[workers_nb - 1];
     int map_blocks = (r - 1) / workers_nb;
     int i;
     int wr_blocks = 0;
+/*    
     for (i = 0; i < workers_nb - 1; i++) {
         processes_array[i] = fork();
         if (-1 == processes_array[i])
@@ -355,6 +388,17 @@ int decrypt_file(const char *pathname, const char *outputfile)
         }
         else
             wr_blocks += map_blocks;
+    }
+*/
+    for (i = 0; i < workers_nb - 1; i++) {
+        if (-1 == (processes_array[i] = process_decrypt(dst, txt, key, map_blocks, map_blocks * i))) {
+            munmap(context, size);
+            munmap(dst_context, newfilesize);
+            close(fd);
+            close(newfd);
+            return 0;
+        }
+        wr_blocks += map_blocks;
     }
 
     int left_blocks = r - 2 - wr_blocks;
@@ -410,8 +454,8 @@ int main(int argc, char **argv)
     int msgKey = -1;
 
     struct option longopts[] = {
-        {"encrypt", required_argument, NULL, 'e'},
-        {"decrypt", required_argument, NULL, 'd'},
+        {"encrypt", no_argument, NULL, 'e'},
+        {"decrypt", no_argument, NULL, 'd'},
         {"processes", required_argument, NULL, 'p'},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0}
