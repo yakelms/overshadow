@@ -11,7 +11,10 @@
 #include <string.h>
 #include <limits.h>
 #include <endian.h>
-
+#ifdef AVX_2
+#include <immintrin.h>
+/* #include <stdalign.h> */
+#endif
 
 #define NAME_PREFIX "crypt_"
 #define PREFIX_LEN strlen(NAME_PREFIX)
@@ -21,6 +24,11 @@
 #define OP_ENCRYPT 0x01
 #define OP_DECRYPT 0x02
 
+#ifdef AVX_2
+#define ALIGN _Alignas(__m256i) //C11
+#else
+#define ALIGN
+#endif
 
 int g_workers_num = 0;
 
@@ -37,15 +45,7 @@ int generate_key(unsigned char *buf, int len)
         long int rand = random();
         *np++ = rand;
         unsigned char *c = (unsigned char *) &rand;
-
-        //printf("%ld , 0x%02x%02x%02x%02x\n", rand, c[0], c[1], c[2], c[3]);
     }
-
-    /* for debug 
-    for (int j = 0; j < len; j++)
-        printf("%02x", buf[j]);
-    printf("\n");
-    */
 
     return 0;
 }
@@ -85,6 +85,72 @@ int get_output_path (const char *pathname, char *newpath, int size, char flag)
     return len;
 }
 
+#ifdef AVX_2
+void xor_256i(__m256i *src, __m256i* dst, int data_len, u_int64_t key)
+{
+    __m256i ymm_key = _mm256_set1_epi64x(key);
+    int ymm_nb = data_len / sizeof(__m256i);
+    for (int k = 0; k < ymm_nb; k++) {
+        __m256i ymm_src = _mm256_loadu_si256(src);
+        _mm256_storeu_si256(dst, _mm256_xor_si256(ymm_src, ymm_key));
+        src++;
+        dst++;
+    }
+    int left = (data_len % sizeof(__m256i)) / sizeof(u_int64_t);
+    u_int64_t *src64 = (u_int64_t *)src;
+    u_int64_t *dst64 = (u_int64_t *)dst;
+    for (int k = 0; k < left; k++) {
+        *dst64++ = *src64++ ^ key;
+    }
+}
+
+void encrypt_test() {
+    printf("encrypt test\n");
+    ALIGN u_int64_t srcs[] = {0xaabbccdd11223344, 0x1232348932129012, 0x1232348932129013,
+        0x1232348932129014, 0x1232348932129015, 0x1232348932129016, 0x1232348932129017,
+        0x1232348932129018, 0x1232348932129019, 0x1232348932129020, 0x1232348932129021};
+    u_int64_t key = 0x23abcd039e126785;
+    generate_key((unsigned char *) &key, sizeof(key));
+    generate_key((unsigned char *) srcs, sizeof(srcs));
+    ALIGN u_int64_t dsts1[11];
+    u_int64_t dsts2[11];
+
+    //encrypt 256
+    xor_256i((__m256i *)srcs, (__m256i *)dsts1, sizeof(srcs), key);
+
+    //encrypt 64
+    int nb = sizeof(srcs) / sizeof(u_int64_t);
+    for (int k = 0; k < nb; k++) {
+        dsts2[k] = srcs[k] ^ key;
+    }
+    printf("encrypt 256:\n");
+    int k;
+    unsigned char *p;
+    p = (unsigned char *)dsts1;
+    for (k = 0; k < sizeof(dsts1); k++) {
+        printf("%02x", p[k]);
+        if ((k+1) % 32 == 0)
+            printf("\n");
+        else
+            printf(" ");
+    }
+    printf("\nencrypt 64:\n");
+    p = (unsigned char *)dsts2;
+    for (k = 0; k < sizeof(dsts2); k++) {
+        printf("%02x", p[k]);
+        if ((k+1) % 32 == 0)
+            printf("\n");
+        else
+            printf(" ");
+    }
+    if (memcmp(dsts1, dsts2, sizeof(dsts1))) {
+        printf("not equal\n");
+    }
+    else
+        printf("equal\n");
+    exit(0);
+}
+#endif
 
 int encrypt_file(const char *pathname, const char *outputfile)
 {
@@ -156,7 +222,7 @@ int encrypt_file(const char *pathname, const char *outputfile)
     u_int64_t *dst = (u_int64_t *)dst_context;
     *dst++ = key;
 
-    void *context = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+    ALIGN void *context = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
     if (MAP_FAILED == context) {
         perror("mmap error:");
         munmap(dst_context, newfilesize);
@@ -165,13 +231,11 @@ int encrypt_file(const char *pathname, const char *outputfile)
         return -1;
     }
 
-    //标准输出重定向到文件时，默认是行缓冲，多进程环境下，缓冲内容被复制到子进程后被冲刷到终端
-    fflush(stdout);
-    fflush(stderr);
 
     int block_num = new_size / sizeof(u_int64_t);
+
+    // only on process is needed if file size is less than 32KB
     int workers_nb = g_workers_num ? g_workers_num : PROCESS_NUM;
-    //if encryption file size is litter than 32KB , used 1 process
     if (block_num < 4096)
         workers_nb = 1;
     int map_blocks = block_num / workers_nb;
@@ -179,16 +243,20 @@ int encrypt_file(const char *pathname, const char *outputfile)
     pid_t processes_array[workers_nb - 1];
     int i;
     int wr_blocks = 0;
+
     for (i = 0; i < workers_nb - 1; i++) {
         processes_array[i] = fork();
         if (-1 == processes_array[i])
             perror("fork");
         else if (0 == processes_array[i]) {
-            u_int64_t *txt = (u_int64_t *)context + (map_blocks * i);
+            ALIGN u_int64_t *txt = (u_int64_t *)context + (map_blocks * i);
             u_int64_t *map = dst + (map_blocks * i);
-            int j;
-            for (j = 0; j < map_blocks; j++)
+#ifdef AVX_2
+            xor_256i((__m256i *)txt, (__m256i *)map, map_blocks * sizeof(u_int64_t), key);
+#else
+            for (int j = 0; j < map_blocks; j++)
                 *map++ = *txt++ ^ key;
+#endif
             munmap(context, size);
             munmap(dst_context, newfilesize);
             close(fd);
@@ -210,7 +278,6 @@ int encrypt_file(const char *pathname, const char *outputfile)
 
     /* 明文文件最后一块不足8字节的以0填充后加密写入加密文件 */
     int last_block_bytes = end ? end : sizeof(u_int64_t);
-    /* printf("last block bytes %d\n", last_block_bytes); */
 #if 0
     u_int64_t tmp = 0;
     unsigned char *t = (unsigned char *)&tmp;
@@ -226,14 +293,11 @@ int encrypt_file(const char *pathname, const char *outputfile)
     #endif
     */
     u_int64_t tmp = (*txt) & htobe64(mask);
-
-    //printf("last %d byte, %#lx, %#lx, mask=%#lx\n", last_block_bytes, tmp, tmp1, mask);
 #endif
     *dst++ = tmp ^ key;
 
     /* 文件最后写入最后一块加密数据的有效字节数，也是加密之后写入 */
     tmp = last_block_bytes;
-
     *dst = tmp ^ key;
 
     for (i = 0; i < workers_nb - 1; i++) {
@@ -247,8 +311,8 @@ int encrypt_file(const char *pathname, const char *outputfile)
     munmap(dst_context, newfilesize);
     close(fd);
     close(e_fd);
-    /* printf("encryption file over, file size %ld bytes\n", newfilesize); */
-    
+    printf("encryption file over, file size %ld bytes\n", newfilesize);
+
     return 0;
 }
 
@@ -262,40 +326,40 @@ int process_decrypt(u_int64_t *dst, u_int64_t *src, u_int64_t key, int blocks, i
     if (-1 == pid) {
         perror("fork");
         return -1;
-    }
-    else if (pid == 0) {
+    } else if (pid == 0) {
         int i;
         u_int64_t *plain = dst + offset;
         u_int64_t *shadow = src + offset;
+#ifdef AVX_2
+        xor_256i((__m256i *)shadow, (__m256i *)plain, blocks * sizeof(u_int64_t), key);
+#else
         for (i = 0; i < blocks; i++) {
             *plain++ = *shadow++ ^ key;
         }
+#endif
 
         exit(EXIT_SUCCESS);
     }
 
+    // parent
     return pid;
 }
 
 int decrypt_file(const char *pathname, const char *outputfile)
 {
-    //为避免输出缓冲复制到子进程中被冲刷到终端
-    setbuf(stdout, NULL);
-    setbuf(stderr, NULL);
-
     int fd;
     if (-1 == (fd = open(pathname, O_RDONLY))) {
         perror(pathname);
         return -1;
     }
 
+    //get file size from file information
     struct stat filestat;
     if (0 != fstat(fd, &filestat)) {
         perror("get file stat error:");
         close(fd);
         return -1;
     }
-
     long int size = filestat.st_size;
     printf("get file %s, size %ld bytes\n", pathname, size);
 
@@ -444,6 +508,10 @@ int decrypt_file(const char *pathname, const char *outputfile)
 
 int main(int argc, char **argv)
 {
+#ifdef AVX_2
+    /* encrypt_test(); */
+#endif
+
     if (argc < 3) {
         usage(argv[0]);
     }
@@ -486,6 +554,10 @@ int main(int argc, char **argv)
                 usage(argv[0]);
         }
     }
+
+    //set stdout and seterr unbuffered
+    setbuf(stdout, NULL);
+    setbuf(stderr, NULL);
 
     int rlt;
     if (mode == ENCRYPT) {

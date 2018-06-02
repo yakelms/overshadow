@@ -1,15 +1,38 @@
-app = overshadow
-RELEASE=1
-ifeq ($(RELEASE),1)
+BIN = overshadow
+SRCS = main.c
+CC = gcc
+RM = rm -rf
+MAKE = make
+CP = cp -rf
+TEST = make_test.sh
+TESTDIR = ./test
+
+ifeq ($(debug),)
 	CFLAGS += -O3
 else
-	CFLAGS += -g2 -O0
+	CFLAGS += -g 
 endif
-$(app):main.c
-	gcc $(CFLAGS) main.c -o $(app)
 
+ifeq ($(avx),1)
+	CFLAGS += -DAVX_2 -mavx2
+endif
+
+$(BIN): $(SRCS)
+	$(CC) $(CFLAGS) -o $@ $^
+
+.PHONY: clean clr test
 clean:
-	rm -rf $(app) crypt_*
+	$(RM) $(BIN) crypt_*
 
 clr:
-	rm -rf crypt_*
+	$(RM) crypt_*
+
+test: 
+	$(MAKE) clean
+	$(MAKE) avx=1
+	$(CP) $(BIN) $(TESTDIR)/
+	$(TESTDIR)/$(TEST) $(BIN) avx_test.log
+	$(MAKE) clean
+	$(MAKE) 
+	$(CP) $(BIN) $(TESTDIR)/
+	$(TESTDIR)/$(TEST) $(BIN) test.log
