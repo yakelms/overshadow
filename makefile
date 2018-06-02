@@ -10,7 +10,7 @@ TESTDIR = ./test
 ifeq ($(debug),)
 	CFLAGS += -O3
 else
-	CFLAGS += -g 
+	CFLAGS += -g -O0
 endif
 
 ifeq ($(avx),1)

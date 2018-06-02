@@ -104,6 +104,30 @@ void xor_256i(__m256i *src, __m256i* dst, int data_len, u_int64_t key)
     }
 }
 
+void xor_256i_(u_int64_t *src, u_int64_t *dst, int data_len, u_int64_t key)
+{
+    static union {
+        u_int64_t u64[4];
+        __m256i ymm;
+    } ymm_mask = {0xffffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff}; 
+    static int boot_size = sizeof(__m256i) / sizeof(u_int64_t);
+    __m256i ymm_key = _mm256_set1_epi64x(key);
+    int ymm_nb = data_len / sizeof(__m256i);
+    for (int k = 0; k < ymm_nb; k++) {
+        __m256i ymm_src = _mm256_maskload_epi64 ((long long const*)src, ymm_mask.ymm);
+        __m256i ymm_dst = _mm256_xor_si256(ymm_src, ymm_key);
+        _mm256_maskstore_epi64 ((long long *)dst, ymm_mask.ymm, ymm_dst);
+        src += boot_size;
+        dst += boot_size;
+    }
+    int left = (data_len % sizeof(__m256i)) / sizeof(u_int64_t);
+    u_int64_t *src64 = (u_int64_t *)src;
+    u_int64_t *dst64 = (u_int64_t *)dst;
+    for (int k = 0; k < left; k++) {
+        *dst64++ = *src64++ ^ key;
+    }
+}
+
 void encrypt_test() {
     printf("encrypt test\n");
     ALIGN u_int64_t srcs[] = {0xaabbccdd11223344, 0x1232348932129012, 0x1232348932129013,
@@ -111,12 +135,12 @@ void encrypt_test() {
         0x1232348932129018, 0x1232348932129019, 0x1232348932129020, 0x1232348932129021};
     u_int64_t key = 0x23abcd039e126785;
     generate_key((unsigned char *) &key, sizeof(key));
-    generate_key((unsigned char *) srcs, sizeof(srcs));
+    /* generate_key((unsigned char *) srcs, sizeof(srcs)); */
     ALIGN u_int64_t dsts1[11];
     u_int64_t dsts2[11];
 
     //encrypt 256
-    xor_256i((__m256i *)srcs, (__m256i *)dsts1, sizeof(srcs), key);
+    xor_256i_(srcs, dsts1, sizeof(srcs), key);
 
     //encrypt 64
     int nb = sizeof(srcs) / sizeof(u_int64_t);
@@ -238,7 +262,13 @@ int encrypt_file(const char *pathname, const char *outputfile)
     int workers_nb = g_workers_num ? g_workers_num : PROCESS_NUM;
     if (block_num < 4096)
         workers_nb = 1;
+#ifdef AVX_2
+    /* int foot_size = sizeof(__m256i) / sizeof(u_int64_t); */
+    /* int map_blocks = (block_num / foot_size) * foot_size; */
     int map_blocks = block_num / workers_nb;
+#else
+    int map_blocks = block_num / workers_nb;
+#endif
     
     pid_t processes_array[workers_nb - 1];
     int i;
@@ -249,10 +279,12 @@ int encrypt_file(const char *pathname, const char *outputfile)
         if (-1 == processes_array[i])
             perror("fork");
         else if (0 == processes_array[i]) {
-            ALIGN u_int64_t *txt = (u_int64_t *)context + (map_blocks * i);
+            //make sure address of txt align as type __m256i
+            u_int64_t *txt = (u_int64_t *)context + (map_blocks * i);
             u_int64_t *map = dst + (map_blocks * i);
 #ifdef AVX_2
-            xor_256i((__m256i *)txt, (__m256i *)map, map_blocks * sizeof(u_int64_t), key);
+            /* xor_256i((__m256i *)txt, (__m256i *)map, map_blocks * sizeof(u_int64_t), key); */
+            xor_256i_(txt, map, map_blocks * sizeof(u_int64_t), key);
 #else
             for (int j = 0; j < map_blocks; j++)
                 *map++ = *txt++ ^ key;
@@ -271,10 +303,17 @@ int encrypt_file(const char *pathname, const char *outputfile)
     int blocks = block_num - wr_blocks - 1;
     u_int64_t *txt = (u_int64_t *)context + wr_blocks;
     dst += wr_blocks;
+#ifdef AVX_2
+    /* xor_256i((__m256i *)txt, (__m256i *)dst, blocks*sizeof(u_int64_t), key); */
+    xor_256i_(txt, dst, blocks*sizeof(u_int64_t), key);
+    dst += blocks;
+    txt += blocks;
+#else
     for (i = 0; i < blocks; i++)
     {
         *dst++ = *txt++ ^ key;
     }
+#endif
 
     /* 明文文件最后一块不足8字节的以0填充后加密写入加密文件 */
     int last_block_bytes = end ? end : sizeof(u_int64_t);
@@ -331,7 +370,8 @@ int process_decrypt(u_int64_t *dst, u_int64_t *src, u_int64_t key, int blocks, i
         u_int64_t *plain = dst + offset;
         u_int64_t *shadow = src + offset;
 #ifdef AVX_2
-        xor_256i((__m256i *)shadow, (__m256i *)plain, blocks * sizeof(u_int64_t), key);
+        /* xor_256i((__m256i *)shadow, (__m256i *)plain, blocks * sizeof(u_int64_t), key); */
+        xor_256i_(shadow, plain, blocks * sizeof(u_int64_t), key);
 #else
         for (i = 0; i < blocks; i++) {
             *plain++ = *shadow++ ^ key;
@@ -433,27 +473,7 @@ int decrypt_file(const char *pathname, const char *outputfile)
     int map_blocks = (r - 1) / workers_nb;
     int i;
     int wr_blocks = 0;
-/*    
-    for (i = 0; i < workers_nb - 1; i++) {
-        processes_array[i] = fork();
-        if (-1 == processes_array[i])
-            perror("fork");
-        else if (0 == processes_array[i]) {
-            u_int64_t *t = txt + (map_blocks * i);
-            u_int64_t *map = dst + (map_blocks * i);
-            int j;
-            for (j = 0; j < map_blocks; j++)
-                *map++ = *t++ ^ key;
-            munmap(context, size);
-            munmap(dst_context, newfilesize);
-            close(fd);
-            close(newfd);
-            return 0;
-        }
-        else
-            wr_blocks += map_blocks;
-    }
-*/
+
     for (i = 0; i < workers_nb - 1; i++) {
         if (-1 == (processes_array[i] = process_decrypt(dst, txt, key, map_blocks, map_blocks * i))) {
             munmap(context, size);
@@ -468,10 +488,16 @@ int decrypt_file(const char *pathname, const char *outputfile)
     int left_blocks = r - 2 - wr_blocks;
     dst += wr_blocks;
     txt += wr_blocks;
+#ifdef AVX_2
+    xor_256i_(txt, dst, left_blocks * sizeof(u_int64_t), key);
+    dst += left_blocks;
+    txt += left_blocks;
+#else
     for (i = 0; i < left_blocks; i++)
     {
         *dst++ = *txt++ ^ key;
     }
+#endif
 
     // mmap 映射长度为内存页大小的整数倍，这里可以直接整个块写入，保存文件会自动按文件长度截断
 #if 0
