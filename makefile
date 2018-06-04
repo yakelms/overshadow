@@ -6,11 +6,11 @@ MAKE = make
 CP = cp -rf
 TEST = make_test.sh
 TESTDIR = ./test
-
+DFLAGS = -pthread
 ifeq ($(debug),)
 	CFLAGS += -O3
 else
-	CFLAGS += -g -O0
+	CFLAGS += -g -O0 -DDEBUG
 endif
 
 ifeq ($(avx),1)
@@ -18,15 +18,31 @@ ifeq ($(avx),1)
 	TESTFLAGS += avx=1
 endif
 
+ifeq ($(real),1)
+	CFLAGS += -DREALTIME
+endif
+
+# performance testing args
+ifeq ($(thread),1)
+	MODE += -m t
+else
+	MODE += -m p
+endif
+
+ifneq ($(workers),)
+	WORKERS += -n $(workers)
+endif
+
+
 $(BIN): $(SRCS)
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) $(DFLAGS) -o $@ $^
 
 .PHONY: clean clr test performance
 clean:
-	$(RM) $(BIN) crypt_*
+	$(RM) $(BIN) crypt_* de_*
 
 clr:
-	$(RM) crypt_*
+	$(RM) crypt_* de_*
 
 # performance testing
 F1G = f1G
@@ -36,10 +52,10 @@ inputs %I, outputs %O\npagefaults: major %F, minor %R\nswaps %W\n\n"
 performance:
 	$(MAKE) clean
 	$(MAKE) $(TESTFLAGS)
-	@truncate -s 0 $(PLOG) && \
+	truncate -s 0 $(PLOG) && \
 	dd bs=2M count=512 if=/dev/urandom of=./$(F1G) 2>&1 1>/dev/null | tee -a $(PLOG) && \
-	time -f $(FMT) ./$(BIN) -e -i ./$(F1G) -o crypt_$(F1G) 2>&1 | tee -a $(PLOG) && \
-	time -f $(FMT) ./$(BIN) -d -i ./crypt_$(F1G) -o de_$(F1G) 2>&1 | tee -a $(PLOG) && \
+	time -f $(FMT) ./$(BIN) -e $(WORKERS) $(MODE) -i ./$(F1G) -o crypt_$(F1G) 2>&1 | tee -a $(PLOG) && \
+	time -f $(FMT) ./$(BIN) -d $(WORKERS) $(MODE) -i ./crypt_$(F1G) -o de_$(F1G) 2>&1 | tee -a $(PLOG) && \
 	diff --speed-large-files de_$(F1G) $(F1G) | tail -n 3 >> $(PLOG) 
 	$(RM) ./*$(F1G)
 

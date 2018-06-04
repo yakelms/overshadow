@@ -1,0 +1,38 @@
+512+0 records in
+512+0 records out
+1073741824 bytes (1.1 GB, 1.0 GiB) copied, 4.75404 s, 226 MB/s
+encryption file over, file size 1073741840 bytes
+real:  10.080s
+user:   0.000s
+sys:   0.000s
+clild user:   0.280s
+child sys:   0.620s
+
+user 0.28
+system 0.62
+real 10.08
+CPU 9%
+text 0, data 0, max 524944 Kbytes
+ inputs 0, outputs 2097200
+pagefaults: major 5, minor 278720
+swaps 0
+
+
+get file ./crypt_f1G, size 1073741840 bytes
+decryption file over, file size 1073741824 bytes.
+real:  13.510s
+user:   0.000s
+sys:   0.000s
+clild user:   0.060s
+child sys:   0.720s
+
+user 0.06
+system 0.72
+real 13.50
+CPU 5%
+text 0, data 0, max 524956 Kbytes
+ inputs 0, outputs 2097224
+pagefaults: major 5, minor 278733
+swaps 0
+
+

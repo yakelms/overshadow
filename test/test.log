@@ -1,0 +1,96 @@
+encryption file over, file size 24 bytes
+real:   0.000s
+user:   0.000s
+sys:   0.000s
+clild user:   0.000s
+child sys:   0.000s
+encrypt f4bytes ok!
+get file /home/lin/Work/programming/apps/file_encryption/overshadow/test/crypt_f4bytes, size 24 bytes
+decryption file over, file size 4 bytes.
+real:   0.000s
+user:   0.000s
+sys:   0.000s
+clild user:   0.000s
+child sys:   0.000s
+decrypt crypt_f4bytes to de_f4bytes ok!
+
+==> test f4bytes OK!
+
+
+encryption file over, file size 24 bytes
+real:   0.000s
+user:   0.000s
+sys:   0.000s
+clild user:   0.000s
+child sys:   0.000s
+encrypt f8bytes ok!
+get file /home/lin/Work/programming/apps/file_encryption/overshadow/test/crypt_f8bytes, size 24 bytes
+decryption file over, file size 8 bytes.
+real:   0.000s
+user:   0.000s
+sys:   0.000s
+clild user:   0.000s
+child sys:   0.000s
+decrypt crypt_f8bytes to de_f8bytes ok!
+
+==> test f8bytes OK!
+
+
+encryption file over, file size 32 bytes
+real:   0.000s
+user:   0.000s
+sys:   0.000s
+clild user:   0.000s
+child sys:   0.000s
+encrypt f16bytes ok!
+get file /home/lin/Work/programming/apps/file_encryption/overshadow/test/crypt_f16bytes, size 32 bytes
+decryption file over, file size 16 bytes.
+real:   0.000s
+user:   0.000s
+sys:   0.000s
+clild user:   0.000s
+child sys:   0.000s
+decrypt crypt_f16bytes to de_f16bytes ok!
+
+==> test f16bytes OK!
+
+
+encryption file over, file size 32784 bytes
+real:   0.000s
+user:   0.000s
+sys:   0.000s
+clild user:   0.000s
+child sys:   0.000s
+encrypt f32kbytes ok!
+get file /home/lin/Work/programming/apps/file_encryption/overshadow/test/crypt_f32kbytes, size 32784 bytes
+decryption file over, file size 32768 bytes.
+real:   0.000s
+user:   0.000s
+sys:   0.000s
+clild user:   0.000s
+child sys:   0.000s
+decrypt crypt_f32kbytes to de_f32kbytes ok!
+
+==> test f32kbytes OK!
+
+
+encryption file over, file size 1048592 bytes
+real:   0.000s
+user:   0.000s
+sys:   0.000s
+clild user:   0.000s
+child sys:   0.000s
+encrypt f1mbytes ok!
+get file /home/lin/Work/programming/apps/file_encryption/overshadow/test/crypt_f1mbytes, size 1048592 bytes
+decryption file over, file size 1048576 bytes.
+real:   0.000s
+user:   0.000s
+sys:   0.000s
+clild user:   0.000s
+child sys:   0.000s
+decrypt crypt_f1mbytes to de_f1mbytes ok!
+
+==> test f1mbytes OK!
+
+
+==> test success!!! \^-^/

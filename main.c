@@ -16,6 +16,8 @@
 #include <immintrin.h>
 /* #include <stdalign.h> */
 #endif
+#include <pthread.h>
+#include <sys/resource.h>
 
 #define NAME_PREFIX "crypt_"
 #define PREFIX_LEN strlen(NAME_PREFIX)
@@ -32,7 +34,11 @@
 #define ALIGN
 #endif
 
+#define WORKER_PROCESS  0
+#define WORKER_THREADS  1
+
 int g_workers_num = -1;
+int worker_mode = WORKER_PROCESS;
 
 int generate_key(unsigned char *buf, int len)
 {
@@ -180,30 +186,86 @@ void encrypt_test() {
 }
 #endif
 
-int xor_worker(u_int64_t *src,
+void xor_proc(u_int64_t *src, u_int64_t *dst, int nb, u_int64_t key)
+{
+#ifdef AVX_2
+    /* xor_256i((__m256i *)shadow, (__m256i *)plain, blocks * sizeof(u_int64_t), key); */
+    xor_256i_(src, dst, nb * sizeof(u_int64_t), key);
+#else
+    for (int j = 0; j < nb; j++) {
+        *dst++ = *src++ ^ key;
+    }
+#endif
+}
+
+struct thread_info {
+    pthread_t tid;
+    u_int64_t *src;
+    u_int64_t *dst;
+    u_int64_t key;
+    int blocks;
+};
+
+void *thread_xor_proc(void *arg)
+{
+    struct thread_info *tinfo = (struct thread_info *)arg;
+    xor_proc(tinfo->src, tinfo->dst, tinfo->blocks, tinfo->key);
+    return NULL;
+}
+
+int xor_threads(u_int64_t *src, u_int64_t *dst, int nb, int threads, u_int64_t key, struct thread_info *t)
+{
+    /* struct thread_info *t = calloc(threads, sizeof(struct thread_info)); */
+    /* struct thread_info *t = malloc(threads * sizeof(struct thread_info)); */
+    /* if (NULL == t) { */
+    /*     perror("malloc"); */
+    /*     return 0; */
+    /* } */
+    /* memset(t, 0, threads * sizeof(struct thread_info)); */
+    /* *tids = t; */
+
+    int map_blocks = (nb - 1) / threads;
+    int wr_blocks = 0;
+    for (int i = 0; i < threads; i++) {
+        t[i].src = src + (map_blocks * i);
+        t[i].dst = dst + (map_blocks * i);
+        t[i].blocks = map_blocks;
+        t[i].key = key;
+        if (0 != pthread_create(&t[i].tid, NULL, thread_xor_proc, &t[i])) {
+            perror("thread_create");
+        } else {
+            wr_blocks += map_blocks;
+        }
+    }
+
+    return wr_blocks;
+}
+
+int xor_process(u_int64_t *src,
         u_int64_t *dst,
         int nb,
         int workers,
         u_int64_t key,
-        pid_t *worker_pids)
+        /* pid_t **worker_pids) */
+        pid_t *pids)
 {
+    /* pid_t *pids = calloc(workers, sizeof(pid_t)); */
+    /* pid_t *pids = malloc(workers * sizeof(pid_t)); */
+    /* if (NULL == pids) { */
+    /*     perror("malloc"); */
+    /*     return 0; */
+    /* } */
+    /* memset(pids, 0, workers * sizeof(pid_t)); */
+    /* *worker_pids = pids; */
+
     int map_blocks = (nb - 1) / workers;
     int wr_blocks = 0;
 
     for (int i = 0; i < workers; i++) {
-        if (-1 == (worker_pids[i] = fork())) {
+        if (-1 == (pids[i] = fork())) {
             perror("fork");
-        } else if (worker_pids[i] == 0) {
-            u_int64_t *d = dst + (map_blocks * i);
-            u_int64_t *s = src + (map_blocks * i);
-#ifdef AVX_2
-            /* xor_256i((__m256i *)shadow, (__m256i *)plain, blocks * sizeof(u_int64_t), key); */
-            xor_256i_(s, d, map_blocks * sizeof(u_int64_t), key);
-#else
-            for (int j = 0; j < map_blocks; j++) {
-                *d++ = *s++ ^ key;
-            }
-#endif
+        } else if (pids[i] == 0) {
+            xor_proc(src + (map_blocks * i), dst + (map_blocks * i), map_blocks, key);
             exit(EXIT_SUCCESS);
         } else
             // parent
@@ -213,6 +275,44 @@ int xor_worker(u_int64_t *src,
     return wr_blocks;
 }
 
+int xor_worker(u_int64_t *src,
+        u_int64_t *dst,
+        int nb,
+        int workers_nb,
+        u_int64_t key,
+        void *workers)
+{
+    int wr_blocks = 0;
+    if (worker_mode == WORKER_PROCESS)
+        wr_blocks = xor_process(src, dst, nb, workers_nb, key, (pid_t *) workers);
+    else
+        wr_blocks = xor_threads(src, dst, nb, workers_nb, key, (struct thread_info *) workers);
+
+    return wr_blocks;
+}
+
+void wait_workers(int workers_nb, void *workers)
+{
+    if (!workers) return;
+
+    if (worker_mode == WORKER_PROCESS) {
+        pid_t *pids = (pid_t *)workers;
+        for (int i = 0; i < workers_nb; i++) {
+            if (0 != pids[i]) {
+                wait(NULL);
+            }
+        }
+    }
+    else {
+        struct thread_info *tinfos = (struct thread_info *)workers;
+        for (int i = 0; i < workers_nb; i++) {
+            if (tinfos[i].tid) {
+                pthread_join(tinfos[i].tid, NULL);
+            }
+        }
+    }
+    /* free(workers); */
+}
 
 int encrypt_file(const char *pathname, const char *outputfile)
 {
@@ -274,6 +374,11 @@ int encrypt_file(const char *pathname, const char *outputfile)
         return -1;
     }
 
+#ifdef REALTIME
+    struct tms start;
+    clock_t realstart = times(&start);
+#endif
+
     void *dst_context = mmap(NULL, newfilesize, PROT_WRITE, MAP_SHARED, e_fd, 0);
     if (MAP_FAILED == dst_context) {
         perror("mmap error:");
@@ -286,7 +391,10 @@ int encrypt_file(const char *pathname, const char *outputfile)
     u_int64_t *dst = (u_int64_t *)dst_context;
     *dst++ = key;
 
-    ALIGN void *context = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+    int mapflag = MAP_SHARED;
+    if (worker_mode == WORKER_THREADS)
+        mapflag = MAP_PRIVATE | MAP_POPULATE;
+    ALIGN void *context = mmap(NULL, size, PROT_READ, mapflag, fd, 0);
     if (MAP_FAILED == context) {
         perror("mmap error:");
         munmap(dst_context, newfilesize);
@@ -295,6 +403,10 @@ int encrypt_file(const char *pathname, const char *outputfile)
         return -1;
     }
 
+#ifdef REALTIME
+    struct tms load;
+    clock_t realload = times(&load);
+#endif
 
     int block_num = new_size / sizeof(u_int64_t);
 
@@ -303,13 +415,20 @@ int encrypt_file(const char *pathname, const char *outputfile)
     if (block_num < 4096)
         workers_nb = 0;
     
-    pid_t processes_array[MAX_WORKERS];
     int i;
     int wr_blocks = 0;
     u_int64_t *txt = (u_int64_t *)context;
 
+    void *workers = NULL;
+    pid_t pids[MAX_WORKERS] = {0};
+    struct thread_info tids[MAX_WORKERS] = {0};
+    if (worker_mode == WORKER_PROCESS)
+        workers = pids;
+    else
+        workers = tids;
+
     if (workers_nb) {
-        wr_blocks = xor_worker(txt, dst, block_num, workers_nb, key, processes_array);
+        wr_blocks = xor_worker(txt, dst, block_num, workers_nb, key, workers);
         txt += wr_blocks;
         dst += wr_blocks;
     }
@@ -351,19 +470,30 @@ int encrypt_file(const char *pathname, const char *outputfile)
     tmp = last_block_bytes;
     *dst = tmp ^ key;
 
-    for (i = 0; i < workers_nb; i++) {
-        if (-1 != processes_array[i]) {
-            /* int wstatus; */
-            /* waitpid(processes_array[i], &wstatus, 0); */    
-            wait(NULL);
-        }
-    }
+    wait_workers(workers_nb, workers);
+
+#ifdef REALTIME
+    struct tms proc;
+    clock_t realproc = times(&proc);
+#endif
 
     // unmap and close file here and the data modified for new file is wirtten to the file itself
     munmap(context, size);
     munmap(dst_context, newfilesize);
     close(fd);
     close(e_fd);
+
+#ifdef REALTIME
+    struct tms write;
+    clock_t realwrite = times(&write);
+    if (realstart > 0 && realload > 0 && realproc > 0 && realwrite > 0 ) {
+        long clktck = sysconf(_SC_CLK_TCK);
+        if (clktck > 0)
+            printf("load: %8.3fs\nproc: %8.3fs\nwrite: %8.3fs\n", (realload - realstart)/(double)clktck,
+                (realproc - realload)/(double)clktck, (realwrite - realproc)/(double)clktck);
+    }
+#endif
+
     printf("encryption file over, file size %ld bytes\n", newfilesize);
 
     return 0;
@@ -399,8 +529,17 @@ int decrypt_file(const char *pathname, const char *outputfile)
         return -1;
     }
 
+
+#ifdef REALTIME
+    struct tms start;
+    clock_t realstart = times(&start);
+#endif
+
     void *context;
-    if (MAP_FAILED == (context = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0))) {
+    int mapflag = MAP_SHARED;
+    if (worker_mode == WORKER_THREADS)
+        mapflag = MAP_PRIVATE | MAP_POPULATE;
+    if (MAP_FAILED == (context = mmap(NULL, size, PROT_READ, mapflag, fd, 0))) {
         perror("mmap error:");
         close(fd);
         return -1;
@@ -447,6 +586,12 @@ int decrypt_file(const char *pathname, const char *outputfile)
         return -1;
     }
 
+
+#ifdef REALTIME
+    struct tms load;
+    clock_t realload = times(&load);
+#endif
+
     u_int64_t *dst = (u_int64_t *)dst_context;
     int workers_nb = g_workers_num == -1 ? g_workers_num : PROCESS_NUM;
     //if encryption file size is litter than 32KB , used 1 process without worker process
@@ -454,10 +599,17 @@ int decrypt_file(const char *pathname, const char *outputfile)
         workers_nb = 0;
 
     /* pid_t processes_array[workers_nb - 1]; */
-    pid_t processes_array[64];
+    void *workers = NULL;
+    pid_t pids[MAX_WORKERS] = {0};
+    struct thread_info tids[MAX_WORKERS] = {0};
+    if (worker_mode == WORKER_PROCESS)
+        workers = pids;
+    else
+        workers = tids;
+
     int wr_blocks = 0;
     if (workers_nb) {
-        wr_blocks = xor_worker(txt, dst, r, workers_nb, key, processes_array);
+        wr_blocks = xor_worker(txt, dst, r, workers_nb, key, workers);
         dst += wr_blocks;
         txt += wr_blocks;
     }
@@ -487,23 +639,39 @@ int decrypt_file(const char *pathname, const char *outputfile)
     *dst = *txt ^ key;
 #endif
 
-    for (int i = 0; i < workers_nb; i++) {
-        if (-1 != processes_array[i]) {
-            /* int wstatus; */
-            /* waitpid(processes_array[i], &wstatus, 0); */    
-            wait(NULL);
-        }
-    }
+    wait_workers(workers_nb, workers);
+
+#ifdef REALTIME
+    struct tms proc;
+    clock_t realproc = times(&proc);
+#endif
+
     munmap(dst_context, newfilesize);
     munmap(context, size);
     close(fd);
     close(newfd);
+
+#ifdef REALTIME
+    struct tms write;
+    clock_t realwrite = times(&write);
+    if (realstart > 0 && realload > 0 && realproc > 0 && realwrite > 0 ) {
+        long clktck = sysconf(_SC_CLK_TCK);
+        if (clktck > 0)
+            printf("load: %8.3fs\nproc: %8.3fs\nwrite: %8.3fs\n", (realload - realstart)/(double)clktck,
+                (realproc - realload)/(double)clktck, (realwrite - realproc)/(double)clktck);
+    }
+#endif
+
     printf("decryption file over, file size %ld bytes.\n", newfilesize);
 
     return 0;
 }
 
-#define usage(app) do { printf("Usage: %s -{e|d|h} [-p <processes>] -i <inputfile> [-o outputfile]\n", (app)); exit(EXIT_FAILURE);}while(0);
+#define usage(app) do { \
+    printf("Usage: %s -{e|d|h} [-n <workers_numb>] [-m p[rocess]|t[hread] -i <inputfile> [-o outputfile]\n", (app)); \
+    exit(EXIT_FAILURE); \
+}while(0);
+
 #define ENCRYPT 0x01
 #define DECRYPT 0x02
 
@@ -522,6 +690,26 @@ void print_times(clock_t real, struct tms *start, struct tms *end)
             (end->tms_cstime - start->tms_cstime)/(double)clktck);
 }
 
+#define pr_limit(resource) print_limit(#resource, resource)
+void print_limit(char *name, int resource)
+{
+    struct rlimit rlim;
+    if (0 > getrlimit(RLIMIT_AS, &rlim)) {
+        perror("getrlimit(RLIMIT_AS):");
+    } else {
+        printf("%-14s\t", name);
+        if (rlim.rlim_cur == RLIM_INFINITY) 
+            printf("cur[INFINITY]\t");
+        else
+            printf("cur[%10ld]\t", rlim.rlim_cur);
+        
+        if (rlim.rlim_max == RLIM_INFINITY)
+            printf("max[INFINITY]\n");
+        else
+            printf("max[%10ld]\n", rlim.rlim_max);
+    }
+}
+
 #define TIMES(real, tms) { if (-1 == (real = times(&tms))) { perror("times"); exit(EXIT_FAILURE);}}
 int main(int argc, char **argv)
 {
@@ -532,6 +720,11 @@ int main(int argc, char **argv)
     if (argc < 3) {
         usage(argv[0]);
     }
+
+#ifdef DEBUG
+    pr_limit(RLIMIT_AS);
+#endif
+
     struct tms start;
     clock_t realstart;
     TIMES(realstart, start);
@@ -544,7 +737,8 @@ int main(int argc, char **argv)
     struct option longopts[] = {
         {"encrypt", no_argument, NULL, 'e'},
         {"decrypt", no_argument, NULL, 'd'},
-        {"processes", required_argument, NULL, 'p'},
+        {"workers_number", required_argument, NULL, 'n'},
+        {"workers_mode", required_argument, NULL, 'm'},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0}
     };
@@ -552,7 +746,7 @@ int main(int argc, char **argv)
     int option_index = 0;
     int msgflag = 0600;
     char *inputfile = NULL, *outputfile = NULL;
-    while ((opt = getopt_long(argc, argv, "edp:hi:o:", longopts, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "edn:hi:o:m:", longopts, &option_index)) != -1) {
         switch (opt) {
             case 'e':
                 mode |= ENCRYPT;
@@ -560,14 +754,26 @@ int main(int argc, char **argv)
             case 'd':
                 mode |= DECRYPT;
                 break;
-            case 'p':
+            case 'n':
                 g_workers_num = strtol(optarg, NULL, 10); 
+                if (g_workers_num > MAX_WORKERS) {
+                    fprintf(stderr, "workers's nubmer must less than %d\n", MAX_WORKERS);
+                    usage(argv[0]);
+                }
                 break;
             case 'i':
                 inputfile = optarg;
                 break;
             case 'o':
                 outputfile = optarg;
+                break;
+            case 'm':
+                if ('t' == optarg[0])
+                    worker_mode = WORKER_THREADS;
+                else if ('p' == optarg[0])
+                    worker_mode = WORKER_PROCESS;
+                else
+                    usage(argv[0]);
                 break;
             case 'h':
             default:
