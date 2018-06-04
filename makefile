@@ -37,7 +37,7 @@ performance:
 	$(MAKE) clean
 	$(MAKE) $(TESTFLAGS)
 	@truncate -s 0 $(PLOG) && \
-	dd bs=2M count=512 if=/dev/urandom of=./$(F1G) &>$(PLOG)\
+	dd bs=2M count=512 if=/dev/urandom of=./$(F1G) 2>&1 1>/dev/null | tee -a $(PLOG) && \
 	time -f $(FMT) ./$(BIN) -e -i ./$(F1G) -o crypt_$(F1G) 2>&1 | tee -a $(PLOG) && \
 	time -f $(FMT) ./$(BIN) -d -i ./crypt_$(F1G) -o de_$(F1G) 2>&1 | tee -a $(PLOG) && \
 	diff --speed-large-files de_$(F1G) $(F1G) | tail -n 3 >> $(PLOG) 

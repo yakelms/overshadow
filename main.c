@@ -10,6 +10,7 @@
 #include <getopt.h>
 #include <string.h>
 #include <limits.h>
+#include <sys/times.h>
 #include <endian.h>
 #ifdef AVX_2
 #include <immintrin.h>
@@ -19,6 +20,7 @@
 #define NAME_PREFIX "crypt_"
 #define PREFIX_LEN strlen(NAME_PREFIX)
 
+#define MAX_WORKERS 64
 #define PROCESS_NUM 4
 
 #define OP_ENCRYPT 0x01
@@ -30,7 +32,7 @@
 #define ALIGN
 #endif
 
-int g_workers_num = 0;
+int g_workers_num = -1;
 
 int generate_key(unsigned char *buf, int len)
 {
@@ -106,6 +108,8 @@ void xor_256i(__m256i *src, __m256i* dst, int data_len, u_int64_t key)
 
 void xor_256i_(u_int64_t *src, u_int64_t *dst, int data_len, u_int64_t key)
 {
+    if (!src || !dst || !data_len) return;
+
     static union {
         u_int64_t u64[4];
         __m256i ymm;
@@ -176,6 +180,40 @@ void encrypt_test() {
 }
 #endif
 
+int xor_worker(u_int64_t *src,
+        u_int64_t *dst,
+        int nb,
+        int workers,
+        u_int64_t key,
+        pid_t *worker_pids)
+{
+    int map_blocks = (nb - 1) / workers;
+    int wr_blocks = 0;
+
+    for (int i = 0; i < workers; i++) {
+        if (-1 == (worker_pids[i] = fork())) {
+            perror("fork");
+        } else if (worker_pids[i] == 0) {
+            u_int64_t *d = dst + (map_blocks * i);
+            u_int64_t *s = src + (map_blocks * i);
+#ifdef AVX_2
+            /* xor_256i((__m256i *)shadow, (__m256i *)plain, blocks * sizeof(u_int64_t), key); */
+            xor_256i_(s, d, map_blocks * sizeof(u_int64_t), key);
+#else
+            for (int j = 0; j < map_blocks; j++) {
+                *d++ = *s++ ^ key;
+            }
+#endif
+            exit(EXIT_SUCCESS);
+        } else
+            // parent
+            wr_blocks += map_blocks;
+    }
+
+    return wr_blocks;
+}
+
+
 int encrypt_file(const char *pathname, const char *outputfile)
 {
     int fd;
@@ -225,8 +263,10 @@ int encrypt_file(const char *pathname, const char *outputfile)
     long int end = size % sizeof(u_int64_t);
     long int new_size = size + (end > 0 ? sizeof(u_int64_t) - end : 0);
 
+    //filesize = plain_file_size + key_size + pad_num_block
     long int newfilesize = new_size + sizeof(u_int64_t) + sizeof(u_int64_t);
-    //mmap 映射不能增加文件长度，必须先增加文件长度，在映射写入文件内容
+
+    //since mmap can't change file size, you must truncate file size first before map it
     if (0 != ftruncate(e_fd, newfilesize)) {
         perror("truncate file failed:");
         close(fd);
@@ -259,50 +299,22 @@ int encrypt_file(const char *pathname, const char *outputfile)
     int block_num = new_size / sizeof(u_int64_t);
 
     // only on process is needed if file size is less than 32KB
-    int workers_nb = g_workers_num ? g_workers_num : PROCESS_NUM;
+    int workers_nb = g_workers_num == -1 ? g_workers_num : PROCESS_NUM;
     if (block_num < 4096)
-        workers_nb = 1;
-#ifdef AVX_2
-    /* int foot_size = sizeof(__m256i) / sizeof(u_int64_t); */
-    /* int map_blocks = (block_num / foot_size) * foot_size; */
-    int map_blocks = block_num / workers_nb;
-#else
-    int map_blocks = block_num / workers_nb;
-#endif
+        workers_nb = 0;
     
-    pid_t processes_array[workers_nb - 1];
+    pid_t processes_array[MAX_WORKERS];
     int i;
     int wr_blocks = 0;
+    u_int64_t *txt = (u_int64_t *)context;
 
-    for (i = 0; i < workers_nb - 1; i++) {
-        processes_array[i] = fork();
-        if (-1 == processes_array[i])
-            perror("fork");
-        else if (0 == processes_array[i]) {
-            //make sure address of txt align as type __m256i
-            u_int64_t *txt = (u_int64_t *)context + (map_blocks * i);
-            u_int64_t *map = dst + (map_blocks * i);
-#ifdef AVX_2
-            /* xor_256i((__m256i *)txt, (__m256i *)map, map_blocks * sizeof(u_int64_t), key); */
-            xor_256i_(txt, map, map_blocks * sizeof(u_int64_t), key);
-#else
-            for (int j = 0; j < map_blocks; j++)
-                *map++ = *txt++ ^ key;
-#endif
-            munmap(context, size);
-            munmap(dst_context, newfilesize);
-            close(fd);
-            close(e_fd);
-            return 0;
-        }
-        else
-            wr_blocks += map_blocks;
+    if (workers_nb) {
+        wr_blocks = xor_worker(txt, dst, block_num, workers_nb, key, processes_array);
+        txt += wr_blocks;
+        dst += wr_blocks;
     }
 
-    //encryption file context and write to encryption file.
-    int blocks = block_num - wr_blocks - 1;
-    u_int64_t *txt = (u_int64_t *)context + wr_blocks;
-    dst += wr_blocks;
+    int blocks = (block_num - 1) - wr_blocks;
 #ifdef AVX_2
     /* xor_256i((__m256i *)txt, (__m256i *)dst, blocks*sizeof(u_int64_t), key); */
     xor_256i_(txt, dst, blocks*sizeof(u_int64_t), key);
@@ -339,13 +351,15 @@ int encrypt_file(const char *pathname, const char *outputfile)
     tmp = last_block_bytes;
     *dst = tmp ^ key;
 
-    for (i = 0; i < workers_nb - 1; i++) {
+    for (i = 0; i < workers_nb; i++) {
         if (-1 != processes_array[i]) {
-            int wstatus;
-            waitpid(processes_array[i], &wstatus, 0);    
+            /* int wstatus; */
+            /* waitpid(processes_array[i], &wstatus, 0); */    
+            wait(NULL);
         }
     }
 
+    // unmap and close file here and the data modified for new file is wirtten to the file itself
     munmap(context, size);
     munmap(dst_context, newfilesize);
     close(fd);
@@ -355,35 +369,6 @@ int encrypt_file(const char *pathname, const char *outputfile)
     return 0;
 }
 
-int process_decrypt(u_int64_t *dst, u_int64_t *src, u_int64_t key, int blocks, int offset)
-{
-    if (!dst || !src || !blocks)
-        return 0;
-
-    pid_t pid;
-    pid = fork();
-    if (-1 == pid) {
-        perror("fork");
-        return -1;
-    } else if (pid == 0) {
-        int i;
-        u_int64_t *plain = dst + offset;
-        u_int64_t *shadow = src + offset;
-#ifdef AVX_2
-        /* xor_256i((__m256i *)shadow, (__m256i *)plain, blocks * sizeof(u_int64_t), key); */
-        xor_256i_(shadow, plain, blocks * sizeof(u_int64_t), key);
-#else
-        for (i = 0; i < blocks; i++) {
-            *plain++ = *shadow++ ^ key;
-        }
-#endif
-
-        exit(EXIT_SUCCESS);
-    }
-
-    // parent
-    return pid;
-}
 
 int decrypt_file(const char *pathname, const char *outputfile)
 {
@@ -415,7 +400,7 @@ int decrypt_file(const char *pathname, const char *outputfile)
     }
 
     void *context;
-    if (MAP_FAILED == (context = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0))) {
+    if (MAP_FAILED == (context = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0))) {
         perror("mmap error:");
         close(fd);
         return -1;
@@ -437,15 +422,14 @@ int decrypt_file(const char *pathname, const char *outputfile)
         return -1;
     }
 
-    int r = size / sizeof(u_int64_t) - 1;       //去掉秘钥
+    int r = size / sizeof(u_int64_t) - 2;       //number of data blocks without key block and last paded block
 
     u_int64_t key = *(u_int64_t *)context;      //get decryption key from first block
     u_int64_t *txt = (u_int64_t *)context + 1;
-    u_int64_t last_block = *(txt + r - 1) ^ key;
+    u_int64_t last_block = *(txt + r) ^ key;
 
     /* 原文件长度等于加密文件长度去掉秘钥块长度，末尾块长度，填充字节长度*/
     long int newfilesize = size - (sizeof(u_int64_t) * 3) + last_block;
-    //mmap 映射不能增加文件长度，必须先增加文件长度，在映射写入文件内容
     if (0 != ftruncate(newfd, newfilesize)) {
         perror("truncate file failed:");
         close(fd);
@@ -464,36 +448,27 @@ int decrypt_file(const char *pathname, const char *outputfile)
     }
 
     u_int64_t *dst = (u_int64_t *)dst_context;
-    int workers_nb = g_workers_num ? g_workers_num : PROCESS_NUM;
-    //if encryption file size is litter than 32KB , used 1 process
-    if (r < 4096)
-        workers_nb = 1;
+    int workers_nb = g_workers_num == -1 ? g_workers_num : PROCESS_NUM;
+    //if encryption file size is litter than 32KB , used 1 process without worker process
+    if (r < 4094)
+        workers_nb = 0;
 
-    pid_t processes_array[workers_nb - 1];
-    int map_blocks = (r - 1) / workers_nb;
-    int i;
+    /* pid_t processes_array[workers_nb - 1]; */
+    pid_t processes_array[64];
     int wr_blocks = 0;
-
-    for (i = 0; i < workers_nb - 1; i++) {
-        if (-1 == (processes_array[i] = process_decrypt(dst, txt, key, map_blocks, map_blocks * i))) {
-            munmap(context, size);
-            munmap(dst_context, newfilesize);
-            close(fd);
-            close(newfd);
-            return 0;
-        }
-        wr_blocks += map_blocks;
+    if (workers_nb) {
+        wr_blocks = xor_worker(txt, dst, r, workers_nb, key, processes_array);
+        dst += wr_blocks;
+        txt += wr_blocks;
     }
 
-    int left_blocks = r - 2 - wr_blocks;
-    dst += wr_blocks;
-    txt += wr_blocks;
+    int left_blocks = r - 1 - wr_blocks;
 #ifdef AVX_2
     xor_256i_(txt, dst, left_blocks * sizeof(u_int64_t), key);
     dst += left_blocks;
     txt += left_blocks;
 #else
-    for (i = 0; i < left_blocks; i++)
+    for (int i = 0; i < left_blocks; i++)
     {
         *dst++ = *txt++ ^ key;
     }
@@ -512,16 +487,17 @@ int decrypt_file(const char *pathname, const char *outputfile)
     *dst = *txt ^ key;
 #endif
 
-    for (i = 0; i < workers_nb - 1; i++) {
+    for (int i = 0; i < workers_nb; i++) {
         if (-1 != processes_array[i]) {
-            int wstatus;
-            waitpid(processes_array[i], &wstatus, 0);    
+            /* int wstatus; */
+            /* waitpid(processes_array[i], &wstatus, 0); */    
+            wait(NULL);
         }
     }
     munmap(dst_context, newfilesize);
-    close(newfd);
     munmap(context, size);
     close(fd);
+    close(newfd);
     printf("decryption file over, file size %ld bytes.\n", newfilesize);
 
     return 0;
@@ -531,7 +507,22 @@ int decrypt_file(const char *pathname, const char *outputfile)
 #define ENCRYPT 0x01
 #define DECRYPT 0x02
 
+void print_times(clock_t real, struct tms *start, struct tms *end)
+{
+    long clktck = sysconf(_SC_CLK_TCK);
+    if (clktck < 0) {
+        perror("sysconf(_SC_CLK_TCK):");
+        return;
+    }
 
+    printf("real:%8.3fs\nuser:%8.3fs\nsys:%8.3fs\nclild user:%8.3fs\nchild sys:%8.3fs\n",
+            real/(double)clktck, (end->tms_utime - start->tms_utime)/(double)clktck,
+            (end->tms_stime - start->tms_stime)/(double)clktck,
+            (end->tms_cutime - start->tms_cutime)/(double)clktck,
+            (end->tms_cstime - start->tms_cstime)/(double)clktck);
+}
+
+#define TIMES(real, tms) { if (-1 == (real = times(&tms))) { perror("times"); exit(EXIT_FAILURE);}}
 int main(int argc, char **argv)
 {
 #ifdef AVX_2
@@ -541,6 +532,9 @@ int main(int argc, char **argv)
     if (argc < 3) {
         usage(argv[0]);
     }
+    struct tms start;
+    clock_t realstart;
+    TIMES(realstart, start);
 
     int qid, opt;
     int mode = 0; /* 0 init, 1 encrypt, 2 decrypt */
@@ -593,6 +587,11 @@ int main(int argc, char **argv)
     } else {
         usage(argv[0]);
     }
+
+    struct tms end;
+    clock_t realend;
+    TIMES(realend, end);
+    print_times(realend-realstart, &start, &end);
 
     if (0 != rlt) {
         exit(EXIT_FAILURE);
