@@ -66,4 +66,4 @@ echo "==> test success!!! \^-^/"|tee -a ${BASEDIR}/${LOG_FILE}
 echo $count
 
 # clean
-rm -rf ${BASEDIR}/crypt_* ${BASEDIR}/de_*
+rm -rf ${BASEDIR}/crypt_* ${BASEDIR}/de_* ${BASEDIR}/${BIN}
