@@ -37,12 +37,15 @@ endif
 $(BIN): $(SRCS)
 	$(CC) $(CFLAGS) $(DFLAGS) -o $@ $^
 
-.PHONY: clean clr test performance
+.PHONY: clean clr install test performance
 clean:
 	$(RM) $(BIN) crypt_* de_*
 
 clr:
 	$(RM) crypt_* de_*
+
+install:
+	$(CP) $(BIN) /usr/local/bin/
 
 # performance testing
 F1G = f1G
@@ -50,7 +53,7 @@ PLOG = ./test/performance.log
 FMT= "\nuser %U\nsystem %S\nreal %e\nCPU %P\ntext %X, data %D, max %M Kbytes\n\
 inputs %I, outputs %O\npagefaults: major %F, minor %R\nswaps %W\n\n"
 performance:
-	$(MAKE) clean
+	$(MAKE) clr
 	$(MAKE) $(TESTFLAGS)
 	truncate -s 0 $(PLOG) && \
 	dd bs=2M count=512 if=/dev/urandom of=./$(F1G) 2>&1 1>/dev/null | tee -a $(PLOG) && \
@@ -61,7 +64,7 @@ performance:
 
 # functional testing
 test: 
-	$(MAKE) clean
+	$(MAKE) clr
 	$(MAKE) avx=1
 	$(CP) $(BIN) $(TESTDIR)/
 	$(TESTDIR)/$(TEST) $(BIN) avx_test.log
