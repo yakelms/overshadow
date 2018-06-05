@@ -2,10 +2,14 @@
 
 ## Description
 cast a shadow on your files
-usage: `overshadow -e [-n workers_nb] [-m p[rocesses]|t[hreades] -i [/path/to/]plain_file [-o [/path/to/]shadow.file]`
+```
+overshadow -e [-n workers_nb] [-m p[rocesses]|t[hreades] -i [/path/to/]plain_file [-o [/path/to/]shadow.file]
+```
 
 wipe off the shadow from your files
-usage: `overshadown -d [-n workers_nb] [-m p[rocesses]|t[hreades] -i [/path/to/]shadow.file -o [/path/to/]plain.file`
+```
+overshadown -d [-n workers_nb] [-m p[rocesses]|t[hreades] -i [/path/to/]shadow.file -o [/path/to/]plain.file
+```
 
 
 ## Download and Install
